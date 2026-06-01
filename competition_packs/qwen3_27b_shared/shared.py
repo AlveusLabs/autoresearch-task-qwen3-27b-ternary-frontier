@@ -19,6 +19,8 @@ import numpy as np
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
 TOKENIZER_ID = MODEL_ID
+VALIDATOR_TOKENIZER_ID = "autoresearch-byte-utf8"
+_VALIDATOR_BYTE_TOKENIZER_IDS = {VALIDATOR_TOKENIZER_ID, "byte-utf8", "bytes"}
 QWEN3_17B_MODEL_ID = "Qwen/Qwen3-1.7B"
 QWEN3_36_27B_MODEL_ID = "Qwen/Qwen3.6-27B"
 PRISM_BINARY_BONSAI_MODEL_ID = "prism-ml/Bonsai-1.7B-gguf"
@@ -392,8 +394,6 @@ def _materialize_model_artifact(artifact_path: Path, work_dir: Path) -> Path:
         root.mkdir(parents=True, exist_ok=True)
         _extract_tar_artifact(artifact_path, root)
         return root
-    if str(os.environ.get("AUTORESEARCH_ALLOW_DIRECT_EVAL_STUB") or "").strip().lower() in {"1", "true", "yes"}:
-        return artifact_path
     raise RuntimeError("submission artifact must be a Hugging Face model directory, .zip, or tar archive")
 
 
@@ -417,30 +417,20 @@ def _artifact_budget_bits(*, parameter_count: int, reference_limits: ReferenceLi
     return int(math.ceil(parameter_count * per_parameter_budget))
 
 
-def _load_direct_eval_stub(artifact_path: Path) -> dict[str, Any] | None:
-    if str(os.environ.get("AUTORESEARCH_ALLOW_DIRECT_EVAL_STUB") or "").strip().lower() not in {"1", "true", "yes"}:
-        return None
-    if not artifact_path.is_file():
-        return None
-    try:
-        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(payload, dict) or payload.get("artifact_type") != "autoresearch-direct-eval-stub":
-        return None
-    return payload
-
-
-def _score_transformer_model(*, model_dir: Path, documents: list[str]) -> dict[str, Any]:
+def _score_transformer_model(
+    *, model_dir: Path, documents: list[str], tokenizer_id: str = VALIDATOR_TOKENIZER_ID
+) -> dict[str, Any]:
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch.nn.functional as torch_functional
+        from transformers import AutoModelForCausalLM
     except Exception as exc:  # pragma: no cover - depends on validator CUDA image dependencies
         raise RuntimeError("direct model evaluation requires torch and transformers") from exc
 
     device_name = str(os.environ.get("AUTORESEARCH_EVAL_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu"))
     device = torch.device(device_name)
     max_tokens = _positive_int_env("AUTORESEARCH_EVAL_MAX_TOKENS", 512)
+    batch_size = _positive_int_env("AUTORESEARCH_EVAL_BATCH_SIZE", 8)
     local_files_only = str(os.environ.get("AUTORESEARCH_EVAL_LOCAL_FILES_ONLY") or "1").strip().lower() not in {
         "0",
         "false",
@@ -448,49 +438,121 @@ def _score_transformer_model(*, model_dir: Path, documents: list[str]) -> dict[s
     }
     device_map_raw = str(os.environ.get("AUTORESEARCH_EVAL_DEVICE_MAP") or "").strip()
     use_device_map = bool(device_map_raw)
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(model_dir),
-        trust_remote_code=True,
-        local_files_only=local_files_only,
-    )
+    eval_tokenizer_id = str(
+        os.environ.get("AUTORESEARCH_EVAL_TOKENIZER_ID") or tokenizer_id or VALIDATOR_TOKENIZER_ID
+    ).strip()
+    if not eval_tokenizer_id:
+        raise RuntimeError("direct model evaluation requires a validator tokenizer id")
+    tokenizer = None
+    if eval_tokenizer_id not in _VALIDATOR_BYTE_TOKENIZER_IDS:
+        try:
+            from transformers import AutoTokenizer
+        except Exception as exc:  # pragma: no cover - depends on validator image dependencies
+            raise RuntimeError("external validator tokenizer evaluation requires transformers AutoTokenizer") from exc
+        tokenizer = AutoTokenizer.from_pretrained(
+            eval_tokenizer_id,
+            trust_remote_code=False,
+            local_files_only=local_files_only,
+        )
     dtype = torch.float16 if device.type == "cuda" else torch.float32
     model_kwargs: dict[str, Any] = {
         "trust_remote_code": True,
         "local_files_only": local_files_only,
         "torch_dtype": dtype,
-        "low_cpu_mem_usage": True,
     }
+    try:
+        import accelerate  # noqa: F401
+    except Exception:
+        pass
+    else:
+        model_kwargs["low_cpu_mem_usage"] = True
     if device_map_raw:
         model_kwargs["device_map"] = device_map_raw
     model = AutoModelForCausalLM.from_pretrained(str(model_dir), **model_kwargs)
     if not use_device_map:
         model.to(device)
     model.eval()
-    input_device = next(model.parameters()).device
+    parameters = list(model.parameters())
+    input_device = parameters[0].device if parameters else device
 
-    total_nll = 0.0
-    total_tokens = 0
+    tokenized_documents: list[tuple[Any, Any | None]] = []
     scored_docs = 0
-    with torch.no_grad():
-        for text in documents:
+    for text in documents:
+        if tokenizer is None:
+            token_ids = [byte + 1 for byte in text.encode("utf-8", errors="replace")[:max_tokens]]
+            input_ids = torch.tensor(token_ids, dtype=torch.long)
+            attention_mask = torch.ones_like(input_ids)
+        else:
             encoded = tokenizer(
                 text,
                 return_tensors="pt",
                 truncation=True,
                 max_length=max_tokens,
             )
-            input_ids = encoded["input_ids"].to(input_device)
-            attention_mask = encoded.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(input_device)
-            token_count = int(input_ids.shape[-1])
-            if token_count < 2:
-                continue
-            output = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
-            label_count = token_count - 1
-            total_nll += float(output.loss.detach().cpu()) * label_count
-            total_tokens += label_count
-            scored_docs += 1
+            input_ids = encoded["input_ids"].reshape(-1)
+            attention_mask_raw = encoded.get("attention_mask")
+            attention_mask = attention_mask_raw.reshape(-1) if attention_mask_raw is not None else None
+        if int(input_ids.shape[0]) < 2:
+            continue
+        tokenized_documents.append((input_ids, attention_mask))
+        scored_docs += 1
+
+    total_nll = 0.0
+    total_tokens = 0
+    with torch.no_grad():
+        for input_ids, attention_mask in tokenized_documents:
+            token_count = int(input_ids.shape[0])
+            past_key_values = None
+            cache_available = True
+            for target_index in range(1, token_count):
+                if cache_available:
+                    input_batch = input_ids[target_index - 1 : target_index].reshape(1, -1).to(input_device)
+                    attention_batch = (
+                        attention_mask[:target_index].reshape(1, -1).to(input_device)
+                        if attention_mask is not None
+                        else None
+                    )
+                    model_kwargs = {
+                        "input_ids": input_batch,
+                        "attention_mask": attention_batch,
+                        "use_cache": True,
+                    }
+                    if past_key_values is not None:
+                        model_kwargs["past_key_values"] = past_key_values
+                    try:
+                        output = model(**model_kwargs)
+                    except TypeError:
+                        cache_available = False
+                        past_key_values = None
+                    else:
+                        past_key_values = getattr(output, "past_key_values", None)
+                        if past_key_values is None:
+                            cache_available = False
+                if not cache_available:
+                    input_batch = input_ids[:target_index].reshape(1, -1).to(input_device)
+                    attention_batch = (
+                        attention_mask[:target_index].reshape(1, -1).to(input_device)
+                        if attention_mask is not None
+                        else None
+                    )
+                    output = model(input_ids=input_batch, attention_mask=attention_batch)
+                targets = input_ids[target_index : target_index + 1].to(input_device).long()
+                logits = getattr(output, "logits", None)
+                if logits is None:
+                    raise RuntimeError("direct model evaluation requires model outputs with logits")
+                if int(logits.ndim) != 3:
+                    raise RuntimeError(f"direct model evaluation expected rank-3 logits, got rank {int(logits.ndim)}")
+                if int(logits.shape[0]) != 1 or int(logits.shape[1]) < 1:
+                    raise RuntimeError("direct model evaluation logits shape does not match input prefix")
+                next_token_logits = logits[:, -1, :].float()
+                if int(next_token_logits.shape[-1]) <= int(targets.max().detach().cpu()):
+                    raise RuntimeError("direct model evaluation logits vocabulary is smaller than validator token ids")
+                if not bool(torch.isfinite(next_token_logits).all().detach().cpu()):
+                    raise RuntimeError("direct model evaluation produced non-finite logits")
+                total_nll += float(
+                    torch_functional.cross_entropy(next_token_logits, targets, reduction="sum").detach().cpu()
+                )
+                total_tokens += int(targets.numel())
     if total_tokens <= 0:
         raise RuntimeError("direct model evaluation produced no scored tokens")
     mean_nll = float(total_nll / total_tokens)
@@ -500,7 +562,9 @@ def _score_transformer_model(*, model_dir: Path, documents: list[str]) -> dict[s
         "scored_docs": scored_docs,
         "token_count": total_tokens,
         "max_tokens_per_doc": max_tokens,
-        "parameter_count": int(sum(parameter.numel() for parameter in model.parameters())),
+        "batch_size": batch_size,
+        "parameter_count": int(sum(parameter.numel() for parameter in parameters)),
+        "tokenizer_id": eval_tokenizer_id,
         "device": str(input_device),
         "dtype": "fp16" if dtype == torch.float16 else "fp32",
     }
@@ -2007,23 +2071,8 @@ def run_direct_model_benchmark(
 
     with tempfile.TemporaryDirectory(prefix="autoresearch-model-artifact-") as temp_dir:
         materialized = _materialize_model_artifact(artifact_path, Path(temp_dir))
-        stub = _load_direct_eval_stub(materialized if materialized.is_file() else artifact_path)
-        if stub is not None:
-            score = {
-                "heldout_ppl": float(stub["heldout_ppl"]),
-                "heldout_cross_entropy_nats": float(
-                    stub.get("heldout_cross_entropy_nats", math.log(float(stub["heldout_ppl"])))
-                ),
-                "scored_docs": len(documents),
-                "token_count": int(stub.get("token_count", len(documents))),
-                "max_tokens_per_doc": _positive_int_env("AUTORESEARCH_EVAL_MAX_TOKENS", 512),
-                "parameter_count": int(stub["parameter_count"]),
-                "device": "stub",
-                "dtype": "stub",
-            }
-        else:
-            model_dir = _find_hf_model_dir(materialized)
-            score = _score_transformer_model(model_dir=model_dir, documents=documents)
+        model_dir = _find_hf_model_dir(materialized)
+        score = _score_transformer_model(model_dir=model_dir, documents=documents)
 
     parameter_count = int(score["parameter_count"])
     if parameter_count > reference_limits.max_parameter_count:
@@ -2104,6 +2153,8 @@ def run_direct_model_benchmark(
             "device": score["device"],
             "dtype": score["dtype"],
             "max_tokens_per_doc": score["max_tokens_per_doc"],
+            "batch_size": score.get("batch_size"),
+            "tokenizer_id": score.get("tokenizer_id", TOKENIZER_ID),
         },
     }
     result_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
